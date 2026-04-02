@@ -34,7 +34,7 @@ from jarvis_command_sdk import (
 )
 from jarvis_command_sdk import IJarvisSecret
 
-from lib.music_assistant_service import (
+from music_assistant_shared.music_assistant_service import (
     MediaType,
     MusicAssistantService,
     QueueOption,
