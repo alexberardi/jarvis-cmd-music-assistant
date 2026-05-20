@@ -335,14 +335,19 @@ class MusicCommand(IJarvisCommand):
     # ------------------------------------------------------------------
 
     def pre_route(self, voice_command: str) -> PreRouteResult | None:
-        text = voice_command.lower().strip()
+        # Whisper transcripts come back with trailing punctuation ("Stop." /
+        # "Skip!") which the bare-verb exact matches don't anticipate. Strip
+        # ending punctuation so phrasings like "stop." reach the same path
+        # as "stop".
+        text = voice_command.lower().strip().rstrip(".!?,;:")
+        normalized = voice_command.strip().rstrip(".!?,;:")
 
         params: Dict[str, Any] | None = None
-        if len(voice_command.split()) <= _MAX_PRE_ROUTE_WORDS:
+        if len(normalized.split()) <= _MAX_PRE_ROUTE_WORDS:
             params = self._match_exact(text)
 
         if params is None:
-            params = self._match_regex(voice_command.strip())
+            params = self._match_regex(normalized)
 
         if params is None:
             return None
@@ -351,6 +356,15 @@ class MusicCommand(IJarvisCommand):
 
     @staticmethod
     def _match_exact(text: str) -> Dict[str, Any] | None:
+        # Bare transport verbs — must be deterministic so a small LLM never
+        # mis-routes "stop" to a generic interrupt or "pause" to something
+        # else. The "stop the music" / "pause the music" phrasings are
+        # rejected by _CONTROL_PLAYER_RE's filler-word list and fall through
+        # here too, so they share the same path.
+        if text in ("stop", "stop the music", "stop playing", "stop the playback"):
+            return {"action": "stop"}
+        if text in ("pause", "pause the music", "pause playing", "pause the playback"):
+            return {"action": "pause"}
         if text in ("resume", "unpause", "continue playing"):
             return {"action": "resume"}
         if text in ("go back", "previous song", "previous track", "last song"):
@@ -392,9 +406,20 @@ class MusicCommand(IJarvisCommand):
         if m:
             action = m.group(1)
             start, end = m.start(2), m.end(2)
-            player = original[start:end].strip()
-            if player and player.lower() not in ("music", "playback", "audio", "it"):
+            player = original[start:end].strip().rstrip(".!?,;:")
+            # Filler words that mean "whatever is playing" rather than a named
+            # speaker. "stop the music" / "pause the song" / etc. should NOT
+            # try to look up a speaker — they should fall through to the
+            # active-player path via the {"action": ...} (no player) branch.
+            if player and player.lower() not in (
+                "music", "playback", "audio", "it",
+                "song", "track", "tunes", "playing", "this", "that",
+            ):
                 return {"action": action, "player": player}
+            # Filler-only — return action with no player so the command uses
+            # active / default.
+            if player:
+                return {"action": action}
 
         return None
 
@@ -685,10 +710,23 @@ class MusicCommand(IJarvisCommand):
         the user almost always means "the thing playing right now" rather
         than a stale default. New playback (`action="play"`) intentionally
         skips active-player and uses the default.
+
+        If an explicit name doesn't resolve to a real speaker BUT something
+        is actively playing, fall through to the active player. This handles
+        "stop the Beatles" / "pause Radiohead" where the LLM-or-regex parser
+        latches onto a track/artist name as if it were a speaker — silently
+        DTRT instead of erroring with "I don't see a speaker called X".
         """
         if player_name:
             player = await service.get_player_by_name(player_name)
-            return player["id"] if player else None
+            if player:
+                return player["id"]
+            # Name unrecognized — could be a misheard track/artist. If music
+            # is actively playing, the user almost certainly means "that".
+            active = await service.get_active_player()
+            if active:
+                return active["id"]
+            return None  # caller surfaces "player_not_found"
 
         active = await service.get_active_player()
         if active:
