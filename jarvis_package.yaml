@@ -22,6 +22,39 @@ packages:
 apt_packages:
   - shairport-sync
 
+# Declarative post-install ops — applied by the node's sudoers-gated
+# jarvis-post-install wrapper after apt + pip install. Bounded by the
+# Pantry-side allow-list (jarvis-pantry/config/post-install-allowlist.yaml).
+#
+# What these two ops accomplish, together:
+#   1. Switch shairport-sync's output backend to PulseAudio so it writes
+#      to the node's pulse session (same one TTS / spotifyd use).
+#   2. Re-parent the systemd service so it runs as the node's own user
+#      with the right XDG_RUNTIME_DIR + PULSE_RUNTIME_PATH, and depends
+#      on user@<UID>.service so it doesn't start before that session exists.
+# Net effect: music routes through the node's audio stack and follows any
+# paired Bluetooth speaker — same model spotifyd uses.
+post_install:
+  - type: set_config_file_value
+    file: /etc/shairport-sync.conf
+    format: libconfig
+    section: general
+    key: output_backend
+    value: pa
+  - type: configure_systemd_service
+    service: shairport-sync
+    run_as: jarvis_user
+    group: audio
+    environment:
+      XDG_RUNTIME_DIR: "/run/user/${UID}"
+      PULSE_RUNTIME_PATH: "/run/user/${UID}/pulse"
+    wants:
+      - "user@${UID}.service"
+    after:
+      - "user@${UID}.service"
+    restart: on-failure
+    restart_sec: 5
+
 setup_guide: |
   ## How this works
 
