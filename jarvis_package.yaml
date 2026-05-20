@@ -22,6 +22,159 @@ packages:
 apt_packages:
   - shairport-sync
 
+setup_guide: |
+  ## How this works
+
+  This command does not play music directly. Instead, it tells your
+  **Music Assistant** server what you asked for, and MA streams the
+  audio back to this node over **AirPlay**. The node receives the
+  AirPlay stream via `shairport-sync` (a small daemon installed
+  automatically when you installed this command) and routes the audio
+  through the node's normal audio stack — so it follows any Bluetooth
+  speaker you've paired, exactly like Jarvis's voice does.
+
+  ```
+  You: "play Radiohead"
+      │
+      ▼
+  Jarvis command-center  →  music command  →  Music Assistant server
+                                                       │
+                                       AirPlay stream  │
+                                                       ▼
+                                              shairport-sync on this node
+                                                       │
+                                                       ▼
+                                                PulseAudio / PipeWire
+                                                       │
+                                                       ▼
+                                       Local speaker  -or-  paired BT speaker
+  ```
+
+  ## Prerequisites
+
+  You need a running **Music Assistant** server somewhere on your LAN —
+  see [music-assistant.io/installation](https://music-assistant.io/installation/)
+  if you haven't set one up yet. MA itself talks to your music sources
+  (Spotify, Apple Music, local files, internet radio, etc.); this
+  command is the voice front-end.
+
+  ## Setup (three secrets in the app)
+
+  After installing the command, fill these in from the settings screen:
+
+  ### 1. `MUSIC_ASSISTANT_URL`
+
+  The MA server's WebSocket URL — e.g. `ws://10.0.0.50:8095/ws`.
+
+  - Must be `ws://` (not `http://`).
+  - Must end in `/ws`.
+  - The host:port is whatever MA listens on (default `8095`).
+
+  ### 2. `MUSIC_ASSISTANT_TOKEN`
+
+  A long-lived auth token. In the MA web UI:
+
+  1. Open MA → Settings → API tokens
+  2. Click **Add token** (give it any label, e.g. "jarvis")
+  3. Copy the generated value into this field.
+
+  ### 3. `MUSIC_ASSISTANT_PLAYER_ID`
+
+  Which speaker MA should stream to when you give a voice command from
+  this node. See the next section — this node *itself* becomes a player
+  in MA after install.
+
+  ## Configuring this node as a player in MA
+
+  Within ~30 seconds of install, this node advertises itself as an
+  AirPlay receiver on your LAN, named after its hostname
+  (e.g. `jarvis-dev`). MA's AirPlay provider auto-discovers it.
+
+  In the MA web UI → **Settings → Players**, find the new entry and:
+
+  ### ⚠️ Set the AirPlay protocol to "AirPlay 1 (RAOP)"
+
+  In the player's **Advanced Protocol Settings**, change "AirPlay
+  protocol version" from `Automatically select` to **`AirPlay 1 (RAOP)`**.
+
+  This matters. `shairport-sync` only implements AirPlay 1 (RAOP). MA's
+  auto-select may pick AirPlay 2 for some devices, which produces a
+  silent failure mode: MA shows the track playing, a TCP connection is
+  established, but no actual audio is sent because the AirPlay 2
+  handshake never completes. Per MA's own docs: *"Shairport and AirPlay
+  2 are currently incompatible due to lack of NTP timing support for
+  AirPlay 2 in Shairport and lack of PTP timing support for AirPlay 2 in
+  Music Assistant."*
+
+  ### Copy the player ID
+
+  Once the player is configured and visible, copy its ID and paste it
+  into `MUSIC_ASSISTANT_PLAYER_ID` in this command's settings. You're
+  done — try "Hey Jarvis, play [something]".
+
+  ## What the install actually did
+
+  This command declares an apt dependency on `shairport-sync` in its
+  manifest. When you installed it, the node:
+
+  1. Cloned this package from GitHub.
+  2. Ran the Pantry-allowlist check against `shairport-sync` (allowed).
+  3. Called the node's `sudo`-gated `jarvis-apt-install` helper to install
+     the package (apt install -y, no recommends, no other privileges).
+  4. Installed `music-assistant-client` as a pip dep.
+  5. Started shairport-sync as the `pi` user so it shares your node's
+     PulseAudio/PipeWire session — that's why music follows your
+     Bluetooth speaker just like Jarvis's voice does.
+
+  No subprocess calls or sudo invocations live in the package's own
+  code — installation went through the same audited path as every other
+  Pantry package.
+
+  ## Troubleshooting
+
+  ### MA says it's playing but I hear nothing
+
+  This is almost always the AirPlay-protocol issue above. In the MA web
+  UI → Settings → Players → *(this node)* → Advanced Protocol Settings,
+  set "AirPlay protocol version" to **AirPlay 1 (RAOP)** explicitly.
+
+  If still silent, also try:
+
+  - Toggle **Enable encryption** in the same Advanced settings.
+  - Toggle **Enable compression** in the same Advanced settings.
+  - Verify shairport-sync is running on the node:
+    `sudo systemctl status shairport-sync` — should be `active (running)`.
+
+  ### Node not showing up as a player in MA
+
+  - Confirm shairport-sync is running (see above).
+  - Confirm mDNS works: from any LAN machine, `avahi-browse -rt _raop._tcp`
+    should list a `*@Jarvis-...` entry for this node.
+  - Confirm MA's **AirPlay** provider is enabled in MA → Settings →
+    Providers.
+
+  ### "I can't reach Music Assistant" voice response
+
+  - `MUSIC_ASSISTANT_URL` must be `ws://host:port/ws` exactly — no
+    `http://`, no missing `/ws`.
+  - `MUSIC_ASSISTANT_TOKEN` must be a valid long-lived token. Regenerate
+    in MA if you're unsure.
+
+  ### Music plays through the wrong speaker
+
+  shairport-sync writes to the node's PulseAudio/PipeWire **default
+  sink** — same as everything else on the node. If a Bluetooth speaker
+  is paired and active, audio follows it; otherwise it plays on the
+  local speaker. Jarvis voice (TTS) stays on the local speaker even when
+  BT is connected. To change which sink is default, use the node's
+  `pactl set-default-sink` or your normal audio routing tool.
+
+  ### Multiple nodes — each becomes its own AirPlay player
+
+  Every Jarvis node that installs this command becomes a separate
+  AirPlay player in MA. You can rename them in MA's player settings and
+  assign them to rooms.
+
 secrets:
   - key: MUSIC_ASSISTANT_URL
     scope: integration
