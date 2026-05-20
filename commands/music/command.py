@@ -108,6 +108,37 @@ _PLAY_PREFIXES = re.compile(
     re.IGNORECASE,
 )
 
+# Trailing words that tell us what KIND of thing the user is asking for.
+# We strip them from the query AND set media_type so MA only searches the
+# matching bucket — otherwise "Miles' first birthday playlist" gets scored
+# against tracks/albums/artists too, and a same-named album beats the
+# actual playlist on similarity (the bug that prompted this).
+#
+# Order is longest-first so "playlists" matches before "playlist", etc.
+_TRAILING_TYPE_HINTS: tuple[tuple[str, str], ...] = (
+    ("playlists", "playlist"),
+    ("playlist", "playlist"),
+    ("albums", "album"),
+    ("album", "album"),
+    ("tracks", "track"),
+    ("track", "track"),
+    ("songs", "track"),
+    ("song", "track"),
+    ("artists", "artist"),
+    ("artist", "artist"),
+    ("stations", "radio"),
+    ("station", "radio"),
+    ("radio", "radio"),
+)
+
+# Filler nouns/articles at the start of a search query — "my favorite",
+# "the new", "a great", "some classic". These add noise to the similarity
+# score and never help match real catalog content.
+_QUERY_LEADING_FILLER = re.compile(
+    r"^(?:my|the|a|an|some|that|this|favorite|favourite|new|classic)\s+",
+    re.IGNORECASE,
+)
+
 
 class MusicCommand(IJarvisCommand):
     """Unified command for playing and controlling music via Music Assistant"""
@@ -161,6 +192,20 @@ class MusicCommand(IJarvisCommand):
                 "string",
                 required=False,
                 description="What to play (only for action='play'): artist, album, song, playlist, or genre",
+            ),
+            JarvisParameter(
+                "media_type",
+                "string",
+                required=False,
+                enum_values=["track", "album", "artist", "playlist", "radio"],
+                description=(
+                    "Optional content type for action='play'. Set when the user "
+                    "names a specific kind: 'playlist'→playlist, 'album'→album, "
+                    "'song'/'track'→track, 'artist'→artist, 'radio station'→radio. "
+                    "Leave unset for ambiguous queries — the command will infer "
+                    "from the query phrasing and fall back to picking the best "
+                    "match across all types."
+                ),
             ),
             JarvisParameter(
                 "player",
@@ -225,6 +270,9 @@ class MusicCommand(IJarvisCommand):
             "For 'turn up the volume' use action='volume_up'",
             "For 'set volume to 50' use action='volume_set' with volume_level=50",
             "For 'louder'/'quieter' use volume_up/volume_down",
+            "When the user names a content kind ('my X playlist', 'the Y album', "
+            "'Z radio station'), set media_type to playlist/album/radio. The "
+            "type word + filler ('my'/'the') get stripped from query.",
         ]
 
     @property
@@ -243,6 +291,22 @@ class MusicCommand(IJarvisCommand):
             CommandExample(
                 voice_command="Play some jazz",
                 expected_parameters={"action": "play", "query": "jazz"},
+            ),
+            CommandExample(
+                voice_command="Play my Miles' first birthday playlist",
+                expected_parameters={
+                    "action": "play",
+                    "query": "Miles' first birthday",
+                    "media_type": "playlist",
+                },
+            ),
+            CommandExample(
+                voice_command="Put on the OK Computer album",
+                expected_parameters={
+                    "action": "play",
+                    "query": "OK Computer",
+                    "media_type": "album",
+                },
             ),
             CommandExample(
                 voice_command="Pause the music",
@@ -424,14 +488,75 @@ class MusicCommand(IJarvisCommand):
         return None
 
     def post_process_tool_call(self, args: Dict[str, Any], voice_command: str) -> Dict[str, Any]:
-        if args.get("action") != "play" or args.get("query"):
+        """Normalize action='play' args before they reach run().
+
+        Two responsibilities:
+          1. If the LLM didn't extract a query, derive one by stripping the
+             play-verb prefix from the voice command.
+          2. Always: detect a trailing type word in the query ("playlist",
+             "album", "song", "track", "artist", "radio"/"station") and
+             strip it, setting `media_type` to the inferred kind. Also
+             strip leading filler ("my", "the", "favorite"). This is the
+             fix for "Play my Miles' first birthday playlist" landing on
+             a same-named album instead of the playlist — once
+             media_type is set, search_and_play only asks MA for that
+             bucket.
+        """
+        if args.get("action") != "play":
             return args
 
-        stripped = _PLAY_PREFIXES.sub("", voice_command).strip()
-        if stripped and stripped.lower() != voice_command.lower():
-            args["query"] = stripped
+        # 1. Seed query from voice command if the LLM didn't provide one.
+        if not args.get("query"):
+            stripped = _PLAY_PREFIXES.sub("", voice_command).strip()
+            if stripped and stripped.lower() != voice_command.lower():
+                args["query"] = stripped
+
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return args
+
+        # 2. Type-word inference + filler strip. Don't override an
+        #    explicit media_type the LLM passed.
+        cleaned, inferred_type = self._infer_media_type_and_clean_query(query)
+        if cleaned and cleaned != query:
+            args["query"] = cleaned
+        if inferred_type and not args.get("media_type"):
+            args["media_type"] = inferred_type
 
         return args
+
+    @staticmethod
+    def _infer_media_type_and_clean_query(text: str) -> tuple[str, Optional[str]]:
+        """Return (cleaned_query, inferred_media_type|None).
+
+        Pure function — easy to test. Strips trailing punctuation, a
+        trailing type word ("playlist", "album", "song", "track",
+        "artist", "radio"/"station") if present, and one or more layers
+        of leading filler ("my favorite", "the new", etc.).
+        """
+        t = text.strip().rstrip(".!?,;:")
+        lower = t.lower()
+        inferred: Optional[str] = None
+        for suffix, mt in _TRAILING_TYPE_HINTS:
+            tail = " " + suffix
+            if lower.endswith(tail):
+                t = t[: -len(tail)].rstrip()
+                inferred = mt
+                break
+            # Bare query that IS only the type word (e.g. "playlist") —
+            # no real search content. Don't strip; let it through and
+            # let the search fail with a useful "no results" message.
+            if lower == suffix:
+                break
+
+        # Peel leading filler in a loop — "my favorite the new" should
+        # collapse cleanly even if it's nonsense.
+        prev = None
+        while prev != t:
+            prev = t
+            t = _QUERY_LEADING_FILLER.sub("", t).strip()
+
+        return t, inferred
 
     # ------------------------------------------------------------------
     # Init / setup
