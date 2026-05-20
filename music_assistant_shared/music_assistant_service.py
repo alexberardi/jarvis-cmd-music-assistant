@@ -5,6 +5,7 @@ Async wrapper around the official music-assistant-client package.
 Provides methods for playing music, controlling playback, and managing players.
 """
 
+from difflib import SequenceMatcher
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -165,6 +166,35 @@ class MusicAssistantService:
             for p in players
         ]
 
+    async def get_active_player(self) -> Optional[Dict[str, Any]]:
+        """Return the player that is currently playing (or paused, then buffering).
+
+        Used so voice commands like "pause" without an explicit player target
+        act on whatever speaker the user is actually using, rather than a
+        configured default that may be sitting idle in a different room.
+        Returns None if no player is in an active state.
+        """
+        if not self._client:
+            return None
+
+        priority = {"playing": 0, "paused": 1, "buffering": 2}
+        candidates: list[tuple[int, Any]] = []
+        for p in self._client.players.players:
+            state = p.state.value if hasattr(p, "state") and p.state else "unknown"
+            if state in priority:
+                candidates.append((priority[state], p))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda t: t[0])
+        p = candidates[0][1]
+        return {
+            "id": p.player_id,
+            "name": p.name,
+            "state": p.state.value if hasattr(p, "state") and p.state else "unknown",
+        }
+
     async def get_player_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         """
         Find player by name (case-insensitive partial match).
@@ -264,6 +294,32 @@ class MusicAssistantService:
         if self._client:
             await self._client.player_queues.repeat(queue_id, mode)
 
+    async def get_queue_state(self, queue_id: str) -> Optional[Dict[str, Any]]:
+        """Return {shuffle_enabled, repeat_mode} for a queue, or None.
+
+        Reads MA's in-memory cache (populated by fetch_state at connect), so
+        it doesn't add a server round-trip. Used by toggle-style commands
+        ("shuffle", "repeat") that need to know current state before flipping.
+        """
+        if not self._client:
+            return None
+        queue = self._client.player_queues.get(queue_id)
+        if not queue:
+            return None
+        return {
+            "shuffle_enabled": queue.shuffle_enabled,
+            "repeat_mode": queue.repeat_mode,
+        }
+
+    async def set_mute(self, player_id: str, muted: bool) -> None:
+        """Mute or unmute a player using MA's native mute flag.
+
+        Preserves the underlying volume — unmute restores prior level,
+        unlike volume_set(0)/volume_set(50) which would clobber it.
+        """
+        if self._client:
+            await self._client.players.volume_mute(player_id, muted)
+
     # --- Search and Play ---
 
     async def search_and_play(
@@ -307,7 +363,7 @@ class MusicAssistantService:
         results = await self._client.music.search(query, media_types, limit=10)
 
         # Find best match
-        item = self._pick_best_result(results, media_type)
+        item = self._pick_best_result(results, media_type, query)
         if not item:
             return {"success": False, "error": f"No results for '{query}'"}
 
@@ -327,33 +383,53 @@ class MusicAssistantService:
     def _pick_best_result(
         self,
         results: Any,
-        preferred_type: Optional[MediaType]
+        preferred_type: Optional[MediaType],
+        query: Optional[str] = None,
     ) -> Optional[Any]:
+        """Pick best search result by name-similarity to the query.
+
+        Scores every item across all media types and returns the highest. Used
+        instead of "first result wins" because MA's per-type ordering is by
+        provider relevance, not cross-type — so a barely-relevant track can
+        beat an exact-match artist. Exact + substring matches get a bonus;
+        preferred_type gets a smaller bonus.
+
+        Falls back to first available across types if query is empty.
         """
-        Pick best search result, preferring the specified type.
+        q = (query or "").lower().strip()
 
-        Args:
-            results: Search results object
-            preferred_type: Preferred media type
+        type_attr: list[tuple[Any, str]] = [
+            (MediaType.TRACK, "tracks"),
+            (MediaType.ALBUM, "albums"),
+            (MediaType.ARTIST, "artists"),
+            (MediaType.PLAYLIST, "playlists"),
+            (MediaType.RADIO, "radio"),
+        ]
 
-        Returns:
-            Best matching item, or None
-        """
-        # Check for preferred type first
-        if preferred_type == MediaType.ARTIST and results.artists:
-            return results.artists[0]
-        if preferred_type == MediaType.ALBUM and results.albums:
-            return results.albums[0]
-        if preferred_type == MediaType.TRACK and results.tracks:
-            return results.tracks[0]
-        if preferred_type == MediaType.PLAYLIST and results.playlists:
-            return results.playlists[0]
-        if preferred_type == MediaType.RADIO and results.radio:
-            return results.radio[0]
+        best: Any = None
+        best_score: float = -1.0
+        for mt, attr in type_attr:
+            items = getattr(results, attr, None) or []
+            for idx, item in enumerate(items):
+                name = (getattr(item, "name", "") or "").lower()
+                if not name:
+                    continue
 
-        # No preference - return first available
-        for items in [results.tracks, results.artists, results.albums,
-                      results.playlists, results.radio]:
-            if items:
-                return items[0]
-        return None
+                sim: float = SequenceMatcher(None, q, name).ratio() if q else 0.0
+                if q and name == q:
+                    sim += 0.5
+                elif q and (q in name or name in q):
+                    sim += 0.15
+
+                # Tiny penalty for items deeper in MA's per-type list, so
+                # ties break toward MA's relevance ranking.
+                score = sim - (idx * 0.02)
+
+                if preferred_type and mt == preferred_type:
+                    score += 0.3
+
+                if score > best_score:
+                    best_score = score
+                    best = item
+
+        return best

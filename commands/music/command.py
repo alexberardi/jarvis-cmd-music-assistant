@@ -9,6 +9,38 @@ import re
 from typing import Any, Dict, List, Optional
 
 try:
+    from music_assistant_client.exceptions import (
+        CannotConnect,
+        ConnectionClosed,
+        ConnectionFailed,
+        InvalidServerVersion,
+        NotConnected,
+        TransportError,
+    )
+except ImportError:  # client not installed in this env
+    CannotConnect = ConnectionClosed = ConnectionFailed = type(  # type: ignore[misc]
+        "_NoMatch", (Exception,), {}
+    )
+    InvalidServerVersion = NotConnected = TransportError = CannotConnect  # type: ignore[assignment]
+
+try:
+    from music_assistant_models.errors import (
+        LoginFailed,
+        MediaNotFoundError,
+        PlayerCommandFailed,
+        PlayerUnavailableError,
+        ProviderUnavailableError,
+        QueueEmpty,
+        UnplayableMediaError,
+    )
+except ImportError:  # models not installed in this env
+    LoginFailed = MediaNotFoundError = PlayerCommandFailed = type(  # type: ignore[misc]
+        "_NoMatch2", (Exception,), {}
+    )
+    PlayerUnavailableError = ProviderUnavailableError = QueueEmpty = LoginFailed  # type: ignore[assignment]
+    UnplayableMediaError = LoginFailed  # type: ignore[assignment]
+
+try:
     from jarvis_log_client import JarvisLogger
 except ImportError:
     import logging
@@ -54,8 +86,8 @@ LLM_ACTIONS = sorted([
 # All actions that run() accepts (specific + collapsed aliases)
 CONTROL_ACTIONS = {
     "pause", "resume", "stop", "next", "previous",
-    "shuffle_on", "shuffle_off", "shuffle",
-    "repeat_off", "repeat_one", "repeat_all", "repeat",
+    "shuffle_on", "shuffle_off", "shuffle", "shuffle_toggle",
+    "repeat_off", "repeat_one", "repeat_all", "repeat", "repeat_toggle",
     "volume_up", "volume_down", "volume_set", "mute", "unmute",
 }
 
@@ -479,9 +511,9 @@ class MusicCommand(IJarvisCommand):
             )
 
         if action == "repeat":
-            action = "repeat_one"
+            action = "repeat_toggle"
         elif action == "shuffle":
-            action = "shuffle_on"
+            action = "shuffle_toggle"
 
         control_kwargs = {k: v for k, v in kwargs.items() if k != "action"}
         return self._run_control(request_info, action, **control_kwargs)
@@ -557,9 +589,11 @@ class MusicCommand(IJarvisCommand):
                 )
             except Exception as e:
                 await service.disconnect()
+                voice_msg, kind = self._voice_error_for(e)
+                logger.error("Music play failed", error=str(e), kind=kind, query=query)
                 return CommandResponse.error_response(
-                    error_details=f"Music playback error: {str(e)}",
-                    context_data={"error": str(e)},
+                    error_details=voice_msg,
+                    context_data={"error": kind, "detail": str(e), "query": query},
                 )
 
         return asyncio.run(play())
@@ -584,7 +618,7 @@ class MusicCommand(IJarvisCommand):
             try:
                 await service.connect()
 
-                player_id = await self._resolve_player(service, player_name)
+                player_id = await self._resolve_control_player(service, player_name)
                 if player_id is None and player_name:
                     await service.disconnect()
                     return CommandResponse.error_response(
@@ -593,31 +627,33 @@ class MusicCommand(IJarvisCommand):
                     )
 
                 if player_id is None:
-                    player_id = self._get_default_player()
-                    if player_id is None:
-                        await service.disconnect()
-                        return CommandResponse.error_response(
-                            error_details="No default speaker configured",
-                            context_data={"error": "no_default_player"},
-                        )
+                    await service.disconnect()
+                    return CommandResponse.error_response(
+                        error_details="Nothing is playing and no default speaker is configured",
+                        context_data={"error": "no_target_player"},
+                    )
 
-                await self._execute_action(service, player_id, action, volume_level)
+                resolved_action = await self._execute_action(
+                    service, player_id, action, volume_level,
+                ) or action
                 await service.disconnect()
 
                 return CommandResponse.success_response(
                     context_data={
-                        "action": action,
+                        "action": resolved_action,
                         "player_id": player_id,
                         "volume_level": volume_level,
-                        "message": self._build_confirmation_message(action, volume_level),
+                        "message": self._build_confirmation_message(resolved_action, volume_level),
                     },
                     wait_for_input=False,
                 )
             except Exception as e:
                 await service.disconnect()
+                voice_msg, kind = self._voice_error_for(e)
+                logger.error("Music control failed", error=str(e), kind=kind, action=action)
                 return CommandResponse.error_response(
-                    error_details=f"Music control error: {str(e)}",
-                    context_data={"error": str(e)},
+                    error_details=voice_msg,
+                    context_data={"error": kind, "detail": str(e), "action": action},
                 )
 
         return asyncio.run(control())
@@ -638,6 +674,27 @@ class MusicCommand(IJarvisCommand):
             player = await service.get_player_by_name(player_name)
             return player["id"] if player else None
         return None
+
+    async def _resolve_control_player(
+        self, service: MusicAssistantService, player_name: Optional[str],
+    ) -> Optional[str]:
+        """Pick the target for a control action (pause/resume/skip/volume/etc.).
+
+        Explicit name > active player > configured default. The active-player
+        step is the difference vs `_resolve_player`: for transport control,
+        the user almost always means "the thing playing right now" rather
+        than a stale default. New playback (`action="play"`) intentionally
+        skips active-player and uses the default.
+        """
+        if player_name:
+            player = await service.get_player_by_name(player_name)
+            return player["id"] if player else None
+
+        active = await service.get_active_player()
+        if active:
+            return active["id"]
+
+        return self._get_default_player()
 
     def _get_default_player(self) -> Optional[str]:
         return self._storage.get_secret("MUSIC_ASSISTANT_PLAYER_ID") or None
@@ -668,7 +725,13 @@ class MusicCommand(IJarvisCommand):
     async def _execute_action(
         self, service: MusicAssistantService, player_id: str,
         action: str, volume_level: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[str]:
+        """Run the action against the player. Returns the resolved action name.
+
+        For toggle actions (shuffle_toggle, repeat_toggle), reads current queue
+        state and decides the concrete sub-action. The caller uses the returned
+        name to build the voice-confirmation message.
+        """
         if action == "pause":
             await service.pause(player_id)
         elif action == "resume":
@@ -685,21 +748,62 @@ class MusicCommand(IJarvisCommand):
             await service.volume_down(player_id)
         elif action == "volume_set":
             if volume_level is not None:
-                await service.set_volume(player_id, volume_level)
+                clamped = max(0, min(100, volume_level))
+                await service.set_volume(player_id, clamped)
         elif action == "mute":
-            await service.set_volume(player_id, 0)
+            await service.set_mute(player_id, True)
         elif action == "unmute":
-            await service.set_volume(player_id, 50)
+            await service.set_mute(player_id, False)
         elif action == "shuffle_on":
             await service.set_shuffle(player_id, True)
         elif action == "shuffle_off":
             await service.set_shuffle(player_id, False)
+        elif action == "shuffle_toggle":
+            state = await service.get_queue_state(player_id)
+            currently_on = bool(state and state.get("shuffle_enabled"))
+            await service.set_shuffle(player_id, not currently_on)
+            return "shuffle_off" if currently_on else "shuffle_on"
         elif action == "repeat_off":
             await service.set_repeat(player_id, RepeatMode.OFF)
         elif action == "repeat_one":
             await service.set_repeat(player_id, RepeatMode.ONE)
         elif action == "repeat_all":
             await service.set_repeat(player_id, RepeatMode.ALL)
+        elif action == "repeat_toggle":
+            state = await service.get_queue_state(player_id)
+            current = state.get("repeat_mode") if state else None
+            currently_on = current is not None and current != RepeatMode.OFF
+            new_mode = RepeatMode.OFF if currently_on else RepeatMode.ONE
+            await service.set_repeat(player_id, new_mode)
+            return "repeat_off" if currently_on else "repeat_one"
+        return action
+
+    def _voice_error_for(self, exc: BaseException) -> tuple[str, str]:
+        """Return (voice_message, error_kind) for an exception raised during a command.
+
+        Keeps str(exc) out of voice output — that's debug-only and goes into
+        context_data["error"]. The voice string should describe what happened
+        from the user's perspective ("I can't reach the music server"),
+        never plumbing details ("Connection refused (errno 111)").
+        """
+        if isinstance(exc, (CannotConnect, ConnectionFailed, ConnectionClosed,
+                            NotConnected, TransportError, asyncio.TimeoutError, OSError)):
+            return ("I can't reach the music server right now", "unreachable")
+        if isinstance(exc, InvalidServerVersion):
+            return ("The music server version isn't compatible", "version_mismatch")
+        if isinstance(exc, LoginFailed):
+            return ("Music server authentication failed", "auth_failed")
+        if isinstance(exc, (MediaNotFoundError, UnplayableMediaError)):
+            return ("I couldn't find that on any music service", "not_found")
+        if isinstance(exc, ProviderUnavailableError):
+            return ("That music provider is unavailable", "provider_down")
+        if isinstance(exc, PlayerUnavailableError):
+            return ("That speaker isn't available right now", "player_unavailable")
+        if isinstance(exc, PlayerCommandFailed):
+            return ("The speaker couldn't do that", "player_cmd_failed")
+        if isinstance(exc, QueueEmpty):
+            return ("There's nothing playing", "queue_empty")
+        return ("Music had an unexpected error", "unexpected")
 
     def _build_confirmation_message(self, action: str, volume_level: Optional[int]) -> str:
         messages = {
