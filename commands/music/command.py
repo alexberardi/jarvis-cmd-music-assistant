@@ -6,7 +6,22 @@ and control playback (pause, resume, skip, volume, shuffle, repeat).
 
 import asyncio
 import re
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Belt + suspenders: ensure our lib dir is on sys.path so
+# ``from music_assistant_shared...`` resolves regardless of whether the
+# node's discovery cache has refreshed since install. Matches the Pantry
+# install convention of ~/.jarvis/packages/<name>/<name>_lib/ (v2.x+) with
+# a fallback to the legacy ~/.jarvis/packages/<name>/lib/ for nodes that
+# pre-date the rename. Without this the failing import retries every
+# discovery cycle, burning CPU and intermittently starving paho-mqtt's
+# keepalive thread.
+for _candidate in ("music_lib", "lib"):
+    _lib_dir: str = str(Path.home() / ".jarvis" / "packages" / "music" / _candidate)
+    if _lib_dir not in sys.path:
+        sys.path.insert(0, _lib_dir)
 
 try:
     from music_assistant_client.exceptions import (
