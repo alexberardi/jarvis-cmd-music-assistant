@@ -322,6 +322,59 @@ class MusicAssistantService:
 
     # --- Search and Play ---
 
+    async def search_for_item(
+        self,
+        query: str,
+        media_type: Optional[MediaType] = None,
+    ) -> Optional[Any]:
+        """Search the MA library and return the single best-matching item.
+
+        Returns the raw MA media item (an Artist/Album/Track/Playlist/Radio
+        object) so callers can both inspect its metadata for a spoken
+        response and pass it to ``play_item`` later. Returns None when MA
+        finds no results across any media type.
+        """
+        if not self._client:
+            return None
+
+        if media_type:
+            media_types = [media_type]
+        else:
+            media_types = [
+                MediaType.TRACK,
+                MediaType.ALBUM,
+                MediaType.ARTIST,
+                MediaType.PLAYLIST,
+                MediaType.RADIO,
+            ]
+
+        results = await self._client.music.search(query, media_types, limit=10)
+        return self._pick_best_result(results, media_type, query)
+
+    async def play_item(
+        self,
+        queue_id: str,
+        item: Any,
+        queue_option: QueueOption = QueueOption.PLAY,
+        radio_mode: bool = False,
+    ) -> None:
+        """Start playback of an item previously returned by ``search_for_item``.
+
+        Split from ``search_and_play`` so callers can defer the play step
+        until the wake-word duck has been released (see jarvis-command-sdk
+        ``CommandResponse.on_response_complete``) — otherwise the first
+        few seconds of audio are streamed into the duck null sink and the
+        user hears the track start mid-song.
+        """
+        if not self._client:
+            raise RuntimeError("Not connected")
+        await self._client.player_queues.play_media(
+            queue_id=queue_id,
+            media=item,
+            option=queue_option,
+            radio_mode=radio_mode,
+        )
+
     async def search_and_play(
         self,
         query: str,
@@ -333,46 +386,20 @@ class MusicAssistantService:
         """
         Search for content and play it.
 
-        Args:
-            query: Search query (artist, album, track name, etc.)
-            queue_id: Queue/player to play on
-            media_type: Optional type filter (ARTIST, ALBUM, TRACK, etc.)
-            queue_option: How to add to queue (PLAY, NEXT, ADD)
-            radio_mode: Enable radio mode for continuous similar music
-
-        Returns:
-            Dict with success status and played item info
+        Kept for backwards-compat with callers that don't need to defer
+        playback. New code that drives playback via voice should prefer the
+        ``search_for_item`` + ``play_item`` split so playback can be deferred
+        until the wake-word duck has been released.
         """
         if not self._client:
             return {"success": False, "error": "Not connected"}
 
-        # Build media types to search - only use common types that most providers support
-        if media_type:
-            media_types = [media_type]
-        else:
-            # Don't include PODCAST, AUDIOBOOK, GENRE as not all providers support them
-            media_types = [
-                MediaType.TRACK,
-                MediaType.ALBUM,
-                MediaType.ARTIST,
-                MediaType.PLAYLIST,
-                MediaType.RADIO,
-            ]
-
-        # Search
-        results = await self._client.music.search(query, media_types, limit=10)
-
-        # Find best match
-        item = self._pick_best_result(results, media_type, query)
+        item = await self.search_for_item(query, media_type)
         if not item:
             return {"success": False, "error": f"No results for '{query}'"}
 
-        # Play
-        await self._client.player_queues.play_media(
-            queue_id=queue_id,
-            media=item,
-            option=queue_option,
-            radio_mode=radio_mode
+        await self.play_item(
+            queue_id, item, queue_option=queue_option, radio_mode=radio_mode,
         )
 
         return {

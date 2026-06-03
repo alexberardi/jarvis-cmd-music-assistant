@@ -709,14 +709,14 @@ class MusicCommand(IJarvisCommand):
         media_type = self._parse_media_type(media_type_str)
         queue_option = self._parse_queue_option(queue_option_str)
 
-        async def play():
+        async def resolve_and_search():
+            """Do the synchronous work: pick the player and find the item."""
             service = self._get_music_service()
             try:
                 await service.connect()
 
                 player_id = await self._resolve_player(service, player_name)
                 if player_id is None and player_name:
-                    await service.disconnect()
                     return CommandResponse.error_response(
                         error_details=f"I don't see a speaker called '{player_name}'",
                         context_data={"error": "player_not_found", "player": player_name},
@@ -725,43 +725,67 @@ class MusicCommand(IJarvisCommand):
                 if player_id is None:
                     player_id = self._get_default_player()
                     if player_id is None:
-                        await service.disconnect()
                         return CommandResponse.error_response(
                             error_details="No default speaker configured",
                             context_data={"error": "no_default_player"},
                         )
 
-                result = await service.search_and_play(
-                    query=query, queue_id=player_id,
-                    media_type=media_type, queue_option=queue_option,
-                )
-                await service.disconnect()
-
-                if result["success"]:
-                    return CommandResponse.success_response(
-                        context_data={
-                            "action": "now_playing",
-                            "item": result["item"],
-                            "query": query,
-                            "player_id": player_id,
-                            "message": f"Now playing {result['item']['name']}",
-                        },
-                        wait_for_input=False,
+                item = await service.search_for_item(query, media_type)
+                if item is None:
+                    return CommandResponse.error_response(
+                        error_details=f"No results found for '{query}'",
+                        context_data={"error": "no_results", "query": query},
                     )
-                return CommandResponse.error_response(
-                    error_details=f"No results found for '{query}'",
-                    context_data={"error": "no_results", "query": query},
+
+                # Defer the actual play_media call until on_response_complete
+                # fires AFTER TTS + duck release — otherwise the first few
+                # seconds of the track stream into the duck null sink and the
+                # user hears the song begin mid-track. The callback opens
+                # its own short-lived MA connection so we don't have to hold
+                # the websocket alive across the TTS gap.
+                _service_factory = self._get_music_service
+
+                def _do_play() -> None:
+                    async def _run() -> None:
+                        svc = _service_factory()
+                        try:
+                            await svc.connect()
+                            await svc.play_item(
+                                queue_id=player_id, item=item,
+                                queue_option=queue_option,
+                            )
+                        finally:
+                            await svc.disconnect()
+                    try:
+                        asyncio.run(_run())
+                    except Exception as e:
+                        logger.error(
+                            "Deferred MA play failed",
+                            error=str(e), query=query,
+                        )
+
+                return CommandResponse.success_response(
+                    context_data={
+                        "action": "now_playing",
+                        "item": {"name": item.name, "type": item.media_type.value},
+                        "query": query,
+                        "player_id": player_id,
+                        "message": f"Now playing {item.name}",
+                    },
+                    wait_for_input=False,
+                    on_response_complete=_do_play,
                 )
             except Exception as e:
-                await service.disconnect()
                 voice_msg, kind = self._voice_error_for(e)
                 logger.error("Music play failed", error=str(e), kind=kind, query=query)
                 return CommandResponse.error_response(
                     error_details=voice_msg,
                     context_data={"error": kind, "detail": str(e), "query": query},
                 )
+            finally:
+                await service.disconnect()
 
-        return asyncio.run(play())
+        return asyncio.run(resolve_and_search())
 
     # ------------------------------------------------------------------
     # Control logic (transport, volume, shuffle, repeat)
