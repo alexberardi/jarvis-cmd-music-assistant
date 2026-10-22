@@ -263,7 +263,7 @@ class MusicCommand(IJarvisCommand):
             ),
             JarvisSecret(
                 "MUSIC_ASSISTANT_PLAYER_ID",
-                "Default player ID (MAC address, e.g., a6:f5:c8:63:26:b5)",
+                "Music Assistant player ID, from MA → Settings → Players → this player (e.g. ap7f66712cd215 for an AirPlay player)",
                 "integration",
                 "string",
                 is_sensitive=False,
