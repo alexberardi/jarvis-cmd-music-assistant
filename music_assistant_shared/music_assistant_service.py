@@ -5,6 +5,7 @@ Async wrapper around the official music-assistant-client package.
 Provides methods for playing music, controlling playback, and managing players.
 """
 
+import re
 from difflib import SequenceMatcher
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,19 @@ except ImportError:
         OFF = "off"
         ONE = "one"    # Repeat current track
         ALL = "all"    # Repeat entire queue
+
+
+# A MAC address, with ':' or '-' separators or none (e.g. 7F:66:71:2C:D2:15).
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(?:[:-]?[0-9a-f]{2}){5}$", re.IGNORECASE)
+
+
+def _player_dict(p: Any) -> Dict[str, Any]:
+    return {
+        "id": p.player_id,
+        "name": p.name,
+        "state": p.state.value if hasattr(p, "state") and p.state else "unknown",
+        "available": bool(getattr(p, "available", True)),
+    }
 
 
 # Import the client when available
@@ -157,14 +171,7 @@ class MusicAssistantService:
 
         # In newer versions, players are accessed via client.players.players property
         players = self._client.players.players
-        return [
-            {
-                "id": p.player_id,
-                "name": p.name,
-                "state": p.state.value if hasattr(p, 'state') and p.state else "unknown"
-            }
-            for p in players
-        ]
+        return [_player_dict(p) for p in players]
 
     async def get_active_player(self) -> Optional[Dict[str, Any]]:
         """Return the player that is currently playing (or paused, then buffering).
@@ -188,12 +195,7 @@ class MusicAssistantService:
             return None
 
         candidates.sort(key=lambda t: t[0])
-        p = candidates[0][1]
-        return {
-            "id": p.player_id,
-            "name": p.name,
-            "state": p.state.value if hasattr(p, "state") and p.state else "unknown",
-        }
+        return _player_dict(candidates[0][1])
 
     async def get_player_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         """
@@ -210,11 +212,7 @@ class MusicAssistantService:
             try:
                 player = await self._client.players.get_by_name(name)
                 if player:
-                    return {
-                        "id": player.player_id,
-                        "name": player.name,
-                        "state": player.state.value if hasattr(player, 'state') and player.state else "unknown"
-                    }
+                    return _player_dict(player)
             except Exception as e:
                 pass  # Fall back to manual search
 
@@ -223,6 +221,43 @@ class MusicAssistantService:
         name_lower = name.lower()
         for p in players:
             if name_lower in p["name"].lower():
+                return p
+        return None
+
+    async def resolve_player(self, ref: str) -> Optional[Dict[str, Any]]:
+        """Find the player a configured reference points at.
+
+        Accepts, in order: an exact MA player_id; a MAC address, mapped to
+        MA's AirPlay id (``ap`` + lowercase hex without separators, e.g.
+        7F:66:71:2C:D2:15 -> ap7f66712cd215) or any id ending in that hex;
+        a player name (exact, case-insensitive, then partial).
+
+        Returns None when nothing matches.
+        """
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+        players = await self.get_players()
+
+        for p in players:
+            if p["id"] == ref:
+                return p
+
+        if _MAC_RE.match(ref):
+            hex_id = re.sub(r"[:-]", "", ref).lower()
+            for p in players:
+                if p["id"] == f"ap{hex_id}":
+                    return p
+            for p in players:
+                if p["id"].lower().endswith(hex_id):
+                    return p
+
+        ref_lower = ref.lower()
+        for p in players:
+            if p["name"].lower() == ref_lower:
+                return p
+        for p in players:
+            if ref_lower in p["name"].lower():
                 return p
         return None
 

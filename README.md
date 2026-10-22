@@ -69,7 +69,7 @@ from the repo.
 |---|---|
 | `MUSIC_ASSISTANT_URL` | WebSocket URL, e.g. `ws://10.0.0.50:8095/ws` |
 | `MUSIC_ASSISTANT_TOKEN` | Long-lived token from MA → Settings → API tokens |
-| `MUSIC_ASSISTANT_PLAYER_ID` | This node's player ID in MA (visible after install) |
+| `MUSIC_ASSISTANT_PLAYER_ID` | This node's player in MA (visible after install): its MA player ID (for AirPlay, `ap` + the lowercase device ID, e.g. `ap7f66712cd215`), its name, or its MAC address (mapped to the `ap…` ID) |
 
 ### ⚠️ Heads-up: AirPlay protocol setting in MA
 

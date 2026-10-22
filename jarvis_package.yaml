@@ -1,7 +1,7 @@
 name: "music"
 display_name: "Music Assistant"
 description: "Play and control music via Music Assistant. Search and play artists, albums, songs, playlists. Control playback, volume, shuffle, and repeat."
-version: "1.2.0"
+version: "1.2.1"
 min_jarvis_version: "0.9.0"
 license: Apache-2.0
 author:
@@ -141,9 +141,18 @@ setup_guide: |
 
   ### Copy the player ID
 
-  Once the player is configured and visible, copy its ID and paste it
-  into `MUSIC_ASSISTANT_PLAYER_ID` in this command's settings. You're
-  done — try "Hey Jarvis, play [something]".
+  Once the player is configured and visible, put it in
+  `MUSIC_ASSISTANT_PLAYER_ID` in this command's settings, as any one of:
+
+  - its Music Assistant **player ID**, shown in the player's settings.
+    For an AirPlay player it is `ap` + the device ID in lowercase, e.g.
+    `ap7f66712cd215` (this is the recommended form);
+  - its **name** as MA shows it (e.g. `jarvis-dev`);
+  - its **MAC address** (e.g. `7F:66:71:2C:D2:15`), which is mapped to
+    the `ap…` ID.
+
+  If the value matches no player, Jarvis says so and names the players
+  MA has. You're done — try "Hey Jarvis, play [something]".
 
   ## What the install actually did
 
@@ -221,5 +230,5 @@ secrets:
   - key: MUSIC_ASSISTANT_PLAYER_ID
     scope: integration
     value_type: string
-    description: "Default player ID (MAC address)"
+    description: "Default player: its Music Assistant player ID (e.g. ap7f66712cd215), its name, or its MAC address"
     is_sensitive: false

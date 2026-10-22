@@ -155,6 +155,15 @@ _QUERY_LEADING_FILLER = re.compile(
 )
 
 
+class _DefaultPlayerNotFound(Exception):
+    """MUSIC_ASSISTANT_PLAYER_ID is set but matches no MA player."""
+
+    def __init__(self, ref: str, names: List[str]) -> None:
+        super().__init__(ref)
+        self.ref = ref
+        self.names = names
+
+
 class MusicCommand(IJarvisCommand):
     """Unified command for playing and controlling music via Music Assistant"""
 
@@ -263,7 +272,8 @@ class MusicCommand(IJarvisCommand):
             ),
             JarvisSecret(
                 "MUSIC_ASSISTANT_PLAYER_ID",
-                "Default player ID (MAC address, e.g., a6:f5:c8:63:26:b5)",
+                "Default player: its Music Assistant player ID (e.g. ap7f66712cd215), "
+                "its name, or its MAC address",
                 "integration",
                 "string",
                 is_sensitive=False,
@@ -715,20 +725,34 @@ class MusicCommand(IJarvisCommand):
             try:
                 await service.connect()
 
-                player_id = await self._resolve_player(service, player_name)
-                if player_id is None and player_name:
+                player = await self._resolve_player(service, player_name)
+                if player is None and player_name:
                     return CommandResponse.error_response(
                         error_details=f"I don't see a speaker called '{player_name}'",
                         context_data={"error": "player_not_found", "player": player_name},
                     )
 
-                if player_id is None:
-                    player_id = self._get_default_player()
-                    if player_id is None:
+                if player is None:
+                    player = await self._get_default_player(service)
+                    if player is None:
                         return CommandResponse.error_response(
                             error_details="No default speaker configured",
                             context_data={"error": "no_default_player"},
                         )
+
+                # The play itself is deferred (below), so this is the last
+                # point where a failure can still reach the user: don't say
+                # "now playing" on a speaker MA can't play on.
+                if not player["available"]:
+                    return CommandResponse.error_response(
+                        error_details=f"The speaker '{player['name']}' isn't available right now",
+                        context_data={
+                            "error": "player_unavailable",
+                            "player_id": player["id"],
+                            "player": player["name"],
+                        },
+                    )
+                player_id = player["id"]
 
                 item = await service.search_for_item(query, media_type)
                 if item is None:
@@ -775,6 +799,8 @@ class MusicCommand(IJarvisCommand):
                     wait_for_input=False,
                     on_response_complete=_do_play,
                 )
+            except _DefaultPlayerNotFound as e:
+                return self._default_player_not_found(e)
             except Exception as e:
                 voice_msg, kind = self._voice_error_for(e)
                 logger.error("Music play failed", error=str(e), kind=kind, query=query)
@@ -836,6 +862,9 @@ class MusicCommand(IJarvisCommand):
                     },
                     wait_for_input=False,
                 )
+            except _DefaultPlayerNotFound as e:
+                await service.disconnect()
+                return self._default_player_not_found(e)
             except Exception as e:
                 await service.disconnect()
                 voice_msg, kind = self._voice_error_for(e)
@@ -858,10 +887,9 @@ class MusicCommand(IJarvisCommand):
 
     async def _resolve_player(
         self, service: MusicAssistantService, player_name: Optional[str],
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, Any]]:
         if player_name:
-            player = await service.get_player_by_name(player_name)
-            return player["id"] if player else None
+            return await service.get_player_by_name(player_name)
         return None
 
     async def _resolve_control_player(
@@ -896,10 +924,50 @@ class MusicCommand(IJarvisCommand):
         if active:
             return active["id"]
 
-        return self._get_default_player()
+        default = await self._get_default_player(service)
+        return default["id"] if default else None
 
-    def _get_default_player(self) -> Optional[str]:
-        return self._storage.get_secret("MUSIC_ASSISTANT_PLAYER_ID") or None
+    async def _get_default_player(
+        self, service: MusicAssistantService,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve MUSIC_ASSISTANT_PLAYER_ID against MA's players.
+
+        Returns None when the setting is empty. Raises _DefaultPlayerNotFound
+        when it is set but matches no player (by id, MAC or name), rather
+        than sending a value MA doesn't know to it.
+        """
+        ref = self._storage.get_secret("MUSIC_ASSISTANT_PLAYER_ID")
+        if not ref:
+            return None
+        player = await service.resolve_player(ref)
+        if player is None:
+            players = await service.get_players()
+            raise _DefaultPlayerNotFound(ref, [p["name"] for p in players])
+        return player
+
+    def _default_player_not_found(self, e: "_DefaultPlayerNotFound") -> CommandResponse:
+        logger.error(
+            "Default player not found in Music Assistant",
+            setting=e.ref, players=", ".join(e.names),
+        )
+        if e.names:
+            shown = ", ".join(e.names[:5])
+            if len(e.names) > 5:
+                shown += f" and {len(e.names) - 5} more"
+            available = f"Music Assistant has: {shown}"
+        else:
+            available = "Music Assistant has no players"
+        return CommandResponse.error_response(
+            error_details=(
+                f"The default speaker '{e.ref}' doesn't match any Music Assistant "
+                f"player. {available}"
+            ),
+            context_data={
+                "error": "default_player_not_found",
+                "setting": e.ref,
+                "players": e.names,
+            },
+        )
 
     def _parse_media_type(self, media_type_str: Optional[str]) -> Optional[MediaType]:
         if not media_type_str:
