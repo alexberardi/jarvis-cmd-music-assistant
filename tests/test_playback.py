@@ -204,3 +204,20 @@ def test_http_base(cmd: MusicCommand, url: str, base: str) -> None:
 def test_binary() -> None:
     with patch("commands.music.command.JarvisStorage"):
         assert MusicCommand().playback_binary == "shairport-sync"
+
+
+def test_the_active_player_is_found_on_current_models() -> None:
+    # Current MA models call it playback_state; reading .state found no active player, so a bare
+    # "pause" went to the configured default speaker instead of the one playing.
+    import asyncio
+
+    from music_assistant_models.player import Player
+
+    def player(pid: str, state: str) -> Player:
+        return Player.from_dict({"player_id": pid, "provider": "airplay", "type": "player", "name": pid,
+                                 "available": True, "playback_state": state, "device_info": {}})
+
+    svc = MusicAssistantService("ws://ma.local:8095/ws")
+    svc._client = MagicMock()
+    svc._client.players.players = [player("kitchen", "idle"), player("office", "playing")]
+    assert asyncio.run(svc.get_active_player()) == {"id": "office", "name": "office", "state": "playing"}

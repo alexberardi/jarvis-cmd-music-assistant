@@ -80,6 +80,12 @@ async def login_with_token(
     return user, token
 
 
+def _player_state(player: Any) -> str:
+    """playing | paused | idle | unknown. Newer models name it playback_state, older ones state."""
+    state = getattr(player, "playback_state", None) or getattr(player, "state", None)
+    return str(state.value) if state is not None and hasattr(state, "value") else "unknown"
+
+
 class MusicAssistantService:
     """
     Wrapper around official Music Assistant client.
@@ -161,7 +167,7 @@ class MusicAssistantService:
             {
                 "id": p.player_id,
                 "name": p.name,
-                "state": p.state.value if hasattr(p, 'state') and p.state else "unknown"
+                "state": _player_state(p)
             }
             for p in players
         ]
@@ -180,7 +186,7 @@ class MusicAssistantService:
         priority = {"playing": 0, "paused": 1, "buffering": 2}
         candidates: list[tuple[int, Any]] = []
         for p in self._client.players.players:
-            state = p.state.value if hasattr(p, "state") and p.state else "unknown"
+            state = _player_state(p)
             if state in priority:
                 candidates.append((priority[state], p))
 
@@ -192,7 +198,7 @@ class MusicAssistantService:
         return {
             "id": p.player_id,
             "name": p.name,
-            "state": p.state.value if hasattr(p, "state") and p.state else "unknown",
+            "state": _player_state(p),
         }
 
     async def get_player_by_name(self, name: str) -> Optional[Dict[str, Any]]:
@@ -213,7 +219,7 @@ class MusicAssistantService:
                     return {
                         "id": player.player_id,
                         "name": player.name,
-                        "state": player.state.value if hasattr(player, 'state') and player.state else "unknown"
+                        "state": _player_state(player)
                     }
             except Exception as e:
                 pass  # Fall back to manual search
