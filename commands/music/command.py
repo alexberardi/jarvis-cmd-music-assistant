@@ -7,7 +7,9 @@ and control playback (pause, resume, skip, volume, shuffle, repeat).
 import asyncio
 import re
 import sys
+import time
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any, Dict, List, Optional
 
 # Belt + suspenders: ensure our lib dir is on sys.path so
@@ -81,6 +83,13 @@ from jarvis_command_sdk import (
 )
 from jarvis_command_sdk import IJarvisSecret
 
+try:
+    from jarvis_command_sdk import IJarvisMusicCommand, PlaybackArtwork, PlaybackState
+except ImportError:  # SDK < 0.16: a plain command; nothing asks it for playback
+    class IJarvisMusicCommand(IJarvisCommand):  # type: ignore[no-redef]
+        def report(self, state: Any = None) -> bool:
+            return False
+
 from music_assistant_shared.music_assistant_service import (
     MediaType,
     MusicAssistantService,
@@ -90,6 +99,17 @@ from music_assistant_shared.music_assistant_service import (
 )
 
 logger = JarvisLogger(service="jarvis-node")
+
+# Now playing (IJarvisMusicCommand)
+_PLAYBACK_ACTIONS = {"play", "pause", "next", "previous", "seek", "volume", "shuffle", "repeat"}
+_REPEAT_NEXT = {"off": "all", "all": "one", "one": "off"}
+_MA_UNREACHABLE = (CannotConnect, ConnectionFailed, ConnectionClosed, NotConnected,
+                   TransportError, asyncio.TimeoutError, OSError)
+_MA_TIMEOUT_SECONDS = 5.0
+# MA applies play, pause, volume and seek a moment after acknowledging them: read back until
+# the change shows (or give up and return what MA says).
+_SETTLE_TRIES, _SETTLE_STEP_SECONDS = 10, 0.1
+_COVER_SIZE = 512
 
 # Actions the LLM sees in the enum (collapsed for 3B accuracy)
 LLM_ACTIONS = sorted([
@@ -155,11 +175,161 @@ _QUERY_LEADING_FILLER = re.compile(
 )
 
 
-class MusicCommand(IJarvisCommand):
+class MusicCommand(IJarvisMusicCommand):
     """Unified command for playing and controlling music via Music Assistant"""
 
     def __init__(self) -> None:
         self._storage = JarvisStorage("music")
+        self._cover: tuple[str, Any] | None = None  # (url, PlaybackArtwork): the current track's
+
+    # -- Playback (IJarvisMusicCommand) ---------------------------------------
+    # MA streams to this node over AirPlay (shairport-sync). The node's display, the mobile
+    # app and the built-in "pause the music" commands see and control what this node's MA
+    # player (MUSIC_ASSISTANT_PLAYER_ID) plays, read from the MA server every time.
+
+    @property
+    def playback_binary(self) -> str:
+        return "shairport-sync"
+
+    def playback_status(self) -> Any:
+        return self._on_ma(self._read_playback)
+
+    def playback_control(self, action: str, **args: Any) -> Any:
+        if action not in _PLAYBACK_ACTIONS:
+            raise ValueError(f"music assistant does not support {action!r}")
+
+        async def control(service: MusicAssistantService, player_id: str) -> Any:
+            queue = await service.get_active_queue(player_id)
+            if queue is None or queue.current_item is None:
+                raise RuntimeError("Nothing is playing on Music Assistant")
+            q = queue.queue_id
+            before = await self._read_playback(service, player_id)
+            if action == "play":
+                await service.resume(q)
+            elif action == "pause":
+                await service.pause(q)
+            elif action == "next":
+                await service.next_track(q)
+            elif action == "previous":
+                await service.previous_track(q)
+            elif action == "seek":
+                await service.seek(q, round(float(args["position"])))
+            elif action == "volume":
+                await service.set_volume(player_id, max(0, min(100, int(args["volume"]))))
+            elif action == "shuffle":
+                await service.set_shuffle(q, not queue.shuffle_enabled)
+            elif action == "repeat":
+                await service.set_repeat(q, RepeatMode(_REPEAT_NEXT[str(queue.repeat_mode.value)]))
+            if action == "seek":
+                target = round(float(args["position"]))
+                settled = lambda st: not st or st.position is None or abs(st.position - target) < 2  # noqa: E731
+            elif action in ("play", "pause", "volume"):
+                seen = lambda st: (st.state, st.volume) if st else None  # noqa: E731
+                settled = lambda st: seen(st) != seen(before)  # noqa: E731
+            else:
+                settled = lambda st: True  # noqa: E731
+            now = await self._read_playback(service, player_id)
+            for _ in range(_SETTLE_TRIES):
+                if settled(now):
+                    break
+                await asyncio.sleep(_SETTLE_STEP_SECONDS)
+                now = await self._read_playback(service, player_id)
+            return now
+
+        return self._on_ma(control, controls=True)
+
+    def playback_artwork(self) -> Any:
+        import aiohttp
+
+        async def artwork(service: MusicAssistantService, player_id: str) -> Any:
+            image = await service.get_current_image(player_id)
+            if not image or not image.get("path"):
+                return None
+            # Through MA's own image proxy: the node only talks to the MA server, never to the
+            # music service's image hosts. MA 2.10+ addresses an image by proxy_id; older
+            # servers by its path, double-encoded as the client does it.
+            base = f"{self._ma_http_base()}/imageproxy"
+            if image.get("proxy_id"):
+                url = f"{base}/{quote(image['proxy_id'], safe='')}?size={_COVER_SIZE}"
+            else:
+                url = (f"{base}?path={quote(quote(image['path']))}"
+                       f"&provider={quote(image.get('provider', ''))}&size={_COVER_SIZE}")
+            if self._cover and self._cover[0] == url:
+                return self._cover[1]
+            token = self._storage.get_secret("MUSIC_ASSISTANT_TOKEN")
+            async with aiohttp.ClientSession() as http, http.get(
+                url, headers={"Authorization": f"Bearer {token}"} if token else {},
+                timeout=aiohttp.ClientTimeout(total=_MA_TIMEOUT_SECONDS),
+            ) as resp:
+                resp.raise_for_status()
+                art = PlaybackArtwork(data=await resp.read(), mime=resp.content_type)
+            self._cover = (url, art)
+            return art
+
+        return self._on_ma(artwork)
+
+    async def _read_playback(self, service: MusicAssistantService, player_id: str) -> Any:
+        queue = await service.get_active_queue(player_id)
+        item = queue.current_item if queue else None
+        state = str(queue.state.value) if queue else ""
+        if item is None or state not in ("playing", "paused"):
+            return None
+        media = item.media_item
+        meta = getattr(item.streamdetails, "stream_metadata", None)  # a station's now-on-air
+        duration = float(item.duration) if item.duration else None  # None: a radio stream
+        position = None
+        if duration:
+            elapsed = queue.elapsed_time
+            if state == "playing":
+                elapsed += max(0.0, time.time() - queue.elapsed_time_last_updated)
+            position = min(elapsed, duration)
+        volume = await service.get_volume(player_id)
+        actions = ["play", "pause", "next", "previous", "shuffle", "repeat"]
+        actions += ["seek"] if duration else []
+        actions += ["volume"] if volume is not None else []
+        return PlaybackState(
+            state=state,
+            media_title=meta.title if meta else (media.name if media else item.name),
+            media_artist=(meta.artist or "") if meta else ", ".join(a.name for a in getattr(media, "artists", None) or []),
+            media_album=(meta.album or "") if meta else getattr(getattr(media, "album", None), "name", "") or "",
+            context=media.name if meta and media else "",
+            position=position,
+            duration=duration,
+            volume=volume,
+            shuffle=queue.shuffle_enabled,
+            repeat=str(queue.repeat_mode.value),
+            actions=tuple(actions),
+        )
+
+    def _on_ma(self, fn: Any, *, controls: bool = False) -> Any:
+        """Run fn(service, player_id) on a short MA connection. A status or cover with MA
+        not set up or unreachable is None (nothing plays here); a control raises."""
+        player_id = self._get_default_player()
+        if not player_id or not self._storage.get_secret("MUSIC_ASSISTANT_URL"):
+            if controls:
+                raise RuntimeError("Music Assistant is not set up on this node")
+            return None
+
+        async def go() -> Any:
+            service = self._get_music_service()
+            try:
+                await asyncio.wait_for(service.connect(), _MA_TIMEOUT_SECONDS)
+                return await fn(service, player_id)
+            finally:
+                await service.disconnect()
+
+        try:
+            return asyncio.run(go())
+        except _MA_UNREACHABLE:
+            if controls:
+                raise
+            return None
+
+    def _ma_http_base(self) -> str:
+        """ws://host:8095/ws -> http://host:8095 (wss -> https)."""
+        url = self._storage.get_secret("MUSIC_ASSISTANT_URL").rstrip("/")
+        url = url[: -len("/ws")] if url.endswith("/ws") else url
+        return "http" + url[len("ws"):] if url.startswith("ws") else url
 
     @property
     def command_name(self) -> str:
@@ -758,6 +928,7 @@ class MusicCommand(IJarvisCommand):
                             await svc.disconnect()
                     try:
                         asyncio.run(_run())
+                        self.report()
                     except Exception as e:
                         logger.error(
                             "Deferred MA play failed",
@@ -845,7 +1016,9 @@ class MusicCommand(IJarvisCommand):
                     context_data={"error": kind, "detail": str(e), "action": action},
                 )
 
-        return asyncio.run(control())
+        response = asyncio.run(control())
+        self.report()
+        return response
 
     # ------------------------------------------------------------------
     # Shared helpers

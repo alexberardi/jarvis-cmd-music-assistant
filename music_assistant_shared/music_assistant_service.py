@@ -80,6 +80,12 @@ async def login_with_token(
     return user, token
 
 
+def _player_state(player: Any) -> str:
+    """playing | paused | idle | unknown. Newer models name it playback_state, older ones state."""
+    state = getattr(player, "playback_state", None) or getattr(player, "state", None)
+    return str(state.value) if state is not None and hasattr(state, "value") else "unknown"
+
+
 class MusicAssistantService:
     """
     Wrapper around official Music Assistant client.
@@ -161,7 +167,7 @@ class MusicAssistantService:
             {
                 "id": p.player_id,
                 "name": p.name,
-                "state": p.state.value if hasattr(p, 'state') and p.state else "unknown"
+                "state": _player_state(p)
             }
             for p in players
         ]
@@ -180,7 +186,7 @@ class MusicAssistantService:
         priority = {"playing": 0, "paused": 1, "buffering": 2}
         candidates: list[tuple[int, Any]] = []
         for p in self._client.players.players:
-            state = p.state.value if hasattr(p, "state") and p.state else "unknown"
+            state = _player_state(p)
             if state in priority:
                 candidates.append((priority[state], p))
 
@@ -192,7 +198,7 @@ class MusicAssistantService:
         return {
             "id": p.player_id,
             "name": p.name,
-            "state": p.state.value if hasattr(p, "state") and p.state else "unknown",
+            "state": _player_state(p),
         }
 
     async def get_player_by_name(self, name: str) -> Optional[Dict[str, Any]]:
@@ -213,7 +219,7 @@ class MusicAssistantService:
                     return {
                         "id": player.player_id,
                         "name": player.name,
-                        "state": player.state.value if hasattr(player, 'state') and player.state else "unknown"
+                        "state": _player_state(player)
                     }
             except Exception as e:
                 pass  # Fall back to manual search
@@ -293,6 +299,38 @@ class MusicAssistantService:
         """
         if self._client:
             await self._client.player_queues.repeat(queue_id, mode)
+
+    async def seek(self, queue_id: str, position: int) -> None:
+        """Seek to a position (seconds) in the current track."""
+        if self._client:
+            await self._client.player_queues.seek(queue_id, position)
+
+    # --- Now playing ---
+
+    async def get_active_queue(self, player_id: str) -> Optional[Any]:
+        """The queue playing on a player (its own, or a group's it is synced to), read from
+        the server."""
+        if not self._client:
+            return None
+        return await self._client.player_queues.get_active_queue(player_id)
+
+    async def get_volume(self, player_id: str) -> Optional[int]:
+        """The player's volume (0-100), read from the server (not the state cached at connect)."""
+        if not self._client:
+            return None
+        player = await self._client.send_command("players/get", player_id=player_id)
+        return (player or {}).get("volume_level")
+
+    async def get_current_image(self, player_id: str) -> Optional[Dict[str, Any]]:
+        """The current item's thumbnail as the server sent it: {path, provider, proxy_id, ...}.
+
+        Raw, not the model: models older than the server drop proxy_id, and MA 2.10+
+        serves images only at /imageproxy/<proxy_id>.
+        """
+        if not self._client:
+            return None
+        raw = await self._client.send_command("player_queues/get_active_queue", player_id=player_id)
+        return ((raw or {}).get("current_item") or {}).get("image")
 
     async def get_queue_state(self, queue_id: str) -> Optional[Dict[str, Any]]:
         """Return {shuffle_enabled, repeat_mode} for a queue, or None.
