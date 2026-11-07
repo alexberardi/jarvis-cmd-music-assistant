@@ -294,6 +294,38 @@ class MusicAssistantService:
         if self._client:
             await self._client.player_queues.repeat(queue_id, mode)
 
+    async def seek(self, queue_id: str, position: int) -> None:
+        """Seek to a position (seconds) in the current track."""
+        if self._client:
+            await self._client.player_queues.seek(queue_id, position)
+
+    # --- Now playing ---
+
+    async def get_active_queue(self, player_id: str) -> Optional[Any]:
+        """The queue playing on a player (its own, or a group's it is synced to), read from
+        the server."""
+        if not self._client:
+            return None
+        return await self._client.player_queues.get_active_queue(player_id)
+
+    async def get_volume(self, player_id: str) -> Optional[int]:
+        """The player's volume (0-100), read from the server (not the state cached at connect)."""
+        if not self._client:
+            return None
+        player = await self._client.send_command("players/get", player_id=player_id)
+        return (player or {}).get("volume_level")
+
+    async def get_current_image(self, player_id: str) -> Optional[Dict[str, Any]]:
+        """The current item's thumbnail as the server sent it: {path, provider, proxy_id, ...}.
+
+        Raw, not the model: models older than the server drop proxy_id, and MA 2.10+
+        serves images only at /imageproxy/<proxy_id>.
+        """
+        if not self._client:
+            return None
+        raw = await self._client.send_command("player_queues/get_active_queue", player_id=player_id)
+        return ((raw or {}).get("current_item") or {}).get("image")
+
     async def get_queue_state(self, queue_id: str) -> Optional[Dict[str, Any]]:
         """Return {shuffle_enabled, repeat_mode} for a queue, or None.
 

@@ -97,6 +97,17 @@ direct audio paths. All it does is translate voice intent into MA API
 calls. shairport-sync (the apt dependency) handles the receive-and-play
 side independently as a systemd service.
 
+### Now playing on the display and in the app
+
+`MusicCommand` is an `IJarvisMusicCommand` (SDK 0.16+). The node shows what
+this node's MA player (`MUSIC_ASSISTANT_PLAYER_ID`) is playing, read from the
+MA server: title, artists, album, cover, position, volume, shuffle and repeat,
+or a station's now-on-air for radio. The display and the mobile app control it
+with play, pause, next, previous, seek, volume, shuffle and repeat. Covers come
+through MA's own image proxy, so the node only talks to your MA server. Music
+MA plays on other speakers doesn't show on this node. On an older SDK it stays
+a plain command.
+
 ## Manifest dependencies
 
 | Type | Name | Why |
